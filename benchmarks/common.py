@@ -4,7 +4,6 @@ import collections
 import copy
 import csv
 import functools
-import gc
 import io
 import itertools
 import logging
@@ -1053,9 +1052,6 @@ def parse_args():
         help="run models that are in the global SKIP list",
     )
     parser.add_argument(
-        "--nvfuser", action="store_true", help="enable nvfuser globally"
-    )
-    parser.add_argument(
         "--prims-nvfuser", action="store_true", help="user prims + nvfuser backend"
     )
     parser.add_argument(
@@ -1063,9 +1059,6 @@ def parse_args():
     )
     parser.add_argument(
         "--nvprims-aten", action="store_true", help="nvprims + aten backend"
-    )
-    parser.add_argument(
-        "--isolate", action="store_true", help="run each model in its own process"
     )
     parser.add_argument(
         "--dump-raw-metrics",
@@ -1081,23 +1074,20 @@ def parse_args():
     )
     parser.add_argument("--batch_size", type=int, help="batch size for benchmarking")
     parser.add_argument(
-        "--batch_size_file", type=str, help="String to load batch size from"
+        "--batch-size-file", type=str, help="String to load batch size from"
     )
     parser.add_argument("--cosine", action="store_true", help="use cosine similarity")
     parser.add_argument(
         "--fast", "-f", action="store_true", help="skip slow benchmarks"
     )
-    parser.add_argument("--only", help="used by --isolate to run just one model")
-    parser.add_argument(
-        "--minimum-call-count", type=int, help="filter out graphs with too few ops"
-    )
+    parser.add_argument("--only", help="Run just one model")
     parser.add_argument(
         "--training",
         action="store_true",
         help="Performs training",
     )
     parser.add_argument(
-        "--dynamic_shapes",
+        "--dynamic-shapes",
         action="store_true",
         help="Runs a dynamic shapes version of the benchmark, if available.",
     )
@@ -1133,7 +1123,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
-        help="Overides the output filename",
+        help="Overrides the output filename",
     )
     parser.add_argument(
         "--export-profiler-trace",
@@ -1142,12 +1132,18 @@ def parse_args():
     )
     parser.add_argument("--profiler_trace_name", help="Overwrites exported trace name")
 
+    group_fuser = parser.add_mutually_exclusive_group()
+    # --nvfuser is now the default, keep the option to not break scripts
+    group_fuser.add_argument("--nvfuser", action="store_true", help=argparse.SUPPRESS)
+    group_fuser.add_argument("--nnc", action="store_true", help="enable NNC for GPUs")
+
     group_prec = parser.add_mutually_exclusive_group()
     group_prec.add_argument("--float16", action="store_true", help="cast model to fp16")
     group_prec.add_argument("--float32", action="store_true", help="cast model to fp32")
     group_prec.add_argument(
         "--amp", action="store_true", help="use automatic mixed precision"
     )
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--coverage", action="store_true", help="(default) " + help(coverage_experiment)
@@ -1292,9 +1288,15 @@ def main(runner, original_dir=None):
     runner.args = args
 
     # defaults
-    args.devices = args.devices or ["cpu"]
     args.filter = args.filter or [r"."]
     args.exclude = args.exclude or [r"^$"]
+
+    if not args.devices:
+        if torch.cuda.is_available():
+            args.devices = ["cuda"]
+        else:
+            log.warning("torch.cuda.is_available() == False, using CPU")
+            args.devices = ["cpu"]
 
     if args.devices != ["cpu"] and torch.cuda.is_available():
         global synchronize
@@ -1328,17 +1330,11 @@ def main(runner, original_dir=None):
         # TODO(jansel): fix bugs in these
         runner.skip_models.update(runner.failing_dynamic_shape_models)
 
-    if args.nvfuser:
-        torch._C._jit_override_can_fuse_on_cpu(False)
-        torch._C._jit_override_can_fuse_on_gpu(False)
-        torch._C._jit_set_texpr_fuser_enabled(False)
-        torch._C._jit_set_nvfuser_enabled(True)
-    else:
+    if args.nnc:
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
         torch._C._jit_set_texpr_fuser_enabled(True)
-        if torch.cuda.is_available():
-            torch._C._jit_set_nvfuser_enabled(False)
+        torch._C._jit_set_nvfuser_enabled(False)
 
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -1581,9 +1577,6 @@ def main(runner, original_dir=None):
     if output_filename:
         output_filename = os.path.join(torchdynamo.config.base_dir, output_filename)
 
-    if args.minimum_call_count:
-        torchdynamo.config.minimum_call_count = args.minimum_call_count
-
     if args.find_batch_sizes:
         args.isolate = True
 
@@ -1677,7 +1670,7 @@ def main(runner, original_dir=None):
                     *Stats.aot_summary(),
                 ],
             )
-    elif args.isolate:
+    else:
         if output_filename and os.path.exists(output_filename):
             os.unlink(output_filename)
         if original_dir:
@@ -1693,35 +1686,6 @@ def main(runner, original_dir=None):
                     output_csv(
                         output_filename, [], [device, name, placeholder_batch_size, 0.0]
                     )
-        print_summary(output_filename)
-    else:
-        if output_filename and os.path.exists(output_filename):
-            os.unlink(output_filename)
-        for device, name, model, example_inputs, batch_size in runner.iter_models(args):
-            current_name = name
-            current_device = device
-            current_batch_size = batch_size
-            torchdynamo.reset()
-            gc.collect()
-
-            if args.float32:
-                model, example_inputs = cast_to_fp32(model, example_inputs)
-            elif args.float16:
-                model, example_inputs = cast_to_fp16(model, example_inputs)
-            runner.run_one_model(
-                name,
-                model,
-                args.training,
-                model_iter_fn,
-                example_inputs,
-                optimize_ctx,
-                accuracy_ctx,
-                experiment,
-                args.skip_accuracy_check,
-                args.dynamic_shapes,
-            )
-
-        Stats.print_summary()
         print_summary(output_filename)
 
 

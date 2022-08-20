@@ -271,7 +271,7 @@ def prims_executor(gm, inputs, *, executor):
     # First we trace the graph conditionally decomposing nodes
     # that may be sent to the nvfuser executor
     with TorchRefsNvfuserCapabilityMode():
-        prim_gm = make_fx(gm.__call__)(*inputs)
+        prim_gm = make_fx(gm.__call__, decomposition_table=torch._prims.context.nvfuser_decomp_table())(*inputs)
     t2 = time()
 
     # This function is called once per forward/backward pass of a graph in AOT

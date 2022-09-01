@@ -1,6 +1,7 @@
 import contextlib
 import dis
 import functools
+import logging
 import os.path
 import types
 import unittest
@@ -18,6 +19,7 @@ from .bytecode_transformation import is_generator
 from .bytecode_transformation import transform_code_object
 from .guards import CheckFunctionManager
 from .guards import GuardedCode
+from .optimizations import BACKENDS
 from .utils import same
 
 unsupported = torchdynamo.eval_frame.unsupported
@@ -118,6 +120,24 @@ class CompileCounter:
         self.op_count = 0
 
 
+class CompileCounterWithBackend:
+    def __init__(self, backend):
+        self.frame_count = 0
+        self.op_count = 0
+        self.backend = backend
+
+    def __call__(self, gm: torch.fx.GraphModule, example_inputs):
+        self.frame_count += 1
+        for node in gm.graph.nodes:
+            if "call" in node.op:
+                self.op_count += 1
+        if self.backend == "inductor":
+            from torchinductor.compile_fx import compile_fx
+
+            return compile_fx(gm, example_inputs)
+        return BACKENDS[self.backend](gm, example_inputs)
+
+
 def standard_test(self, fn, nargs, expected_ops=None, expected_ops_dynamic=None):
     if torchdynamo.config.dynamic_shapes and expected_ops_dynamic is not None:
         expected_ops = expected_ops_dynamic
@@ -162,7 +182,7 @@ class TestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._exit_stack = contextlib.ExitStack()
-        cls._exit_stack.enter_context(patch.object(config, "debug", True))
+        cls._exit_stack.enter_context(patch.object(config, "log_level", logging.DEBUG))
         cls._exit_stack.enter_context(
             patch.object(config, "raise_on_backend_error", True)
         )
@@ -207,3 +227,35 @@ def rand_strided(size, stride, dtype=torch.float32, device="cpu"):
     else:
         buffer = torch.zeros(size=[needed_size], dtype=dtype, device=device)
     return torch.as_strided(buffer, size, stride)
+
+
+def _make_fn_with_patches(fn, *patches):
+    @functools.wraps(fn)
+    def _fn(*args, **kwargs):
+        with contextlib.ExitStack() as stack:
+            for attr, val in patches:
+                stack.enter_context(patch.object(torchdynamo.config, attr, val))
+
+            return fn(*args, **kwargs)
+
+    return _fn
+
+
+def make_test_cls_with_patches(cls, cls_prefix, fn_suffix, *patches):
+    class DummyTestClass(cls):
+        pass
+
+    DummyTestClass.__name__ = f"{cls_prefix}{cls.__name__}"
+
+    for name in dir(cls):
+        if name.startswith("test_"):
+            fn = getattr(cls, name)
+            if not callable(fn):
+                continue
+            new_name = f"{name}{fn_suffix}"
+            fn = _make_fn_with_patches(fn, *patches)
+            fn.__name__ = new_name
+            setattr(DummyTestClass, name, None)
+            setattr(DummyTestClass, new_name, fn)
+
+    return DummyTestClass

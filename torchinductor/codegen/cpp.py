@@ -8,6 +8,7 @@ from typing import List
 
 import sympy
 import torch
+from torch._prims_common import is_float_dtype
 
 from .. import codecache
 from .. import config
@@ -25,6 +26,7 @@ from .common import OpOverrides
 DTYPE_TO_CPP = {
     torch.float32: "float",
     torch.float64: "double",
+    torch.float16: "half",
     torch.int64: "long",
     torch.int32: "int",
     torch.int16: "short",
@@ -38,11 +40,18 @@ INDEX_TYPE = "long"
 def reduction_init(reduction_type, dtype):
     if reduction_type in ("sum", "any"):
         return 0
-    # TODO(jansel): infinity for floats?
     if reduction_type in {"max", "argmax"}:
-        return f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::min()"
+        return (
+            f"-std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::infinity()"
+            if is_float_dtype(dtype)
+            else f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::min()"
+        )
     if reduction_type in {"min", "argmin"}:
-        return f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::max()"
+        return (
+            f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::infinity()"
+            if is_float_dtype(dtype)
+            else f"std::numeric_limits<{DTYPE_TO_CPP[dtype]}>::max()"
+        )
     assert False, reduction_type
 
 
@@ -57,14 +66,14 @@ def reduction_combine(reduction_type, var, next_value):
 index_value_name_counter = 1
 
 
-def argmax_argmin_prefix(reduction_type, dtype, tmpvar):
+def argmax_argmin_prefix(reduction_type, src_dtype, tmpvar):
     global index_value_name_counter
     struct_name = f"IndexValue_{index_value_name_counter}"
     index_value_name_counter += 1
 
     prefix = [
-        f"struct {struct_name} {{size_t index; {DTYPE_TO_CPP[dtype]} value;}};",
-        f"{struct_name} {tmpvar}(0, {reduction_init(reduction_type, dtype)});",
+        f"struct {struct_name} {{long index; {DTYPE_TO_CPP[src_dtype]} value;}};",
+        f"{struct_name} {tmpvar}(0, {reduction_init(reduction_type, src_dtype)});",
     ]
     if reduction_type == "argmax":
         prefix.extend(
@@ -72,7 +81,7 @@ def argmax_argmin_prefix(reduction_type, dtype, tmpvar):
                 f"#pragma omp declare reduction(argmax : struct {struct_name} :\\",
                 "    omp_out.value = omp_in.value < omp_out.value ? omp_out.value : omp_in.value,\\",
                 "    omp_out.index = omp_in.value < omp_out.value ? omp_out.index : omp_in.index)\\",
-                f"\tinitializer(omp_priv = {{0, {reduction_init(reduction_type, dtype)}}})",
+                f"\tinitializer(omp_priv = {{0, {reduction_init(reduction_type, src_dtype)}}})",
             ]
         )
     elif reduction_type == "argmin":
@@ -81,7 +90,7 @@ def argmax_argmin_prefix(reduction_type, dtype, tmpvar):
                 f"#pragma omp declare reduction(argmin : struct {struct_name} :\\",
                 "    omp_out.value = omp_in.value > omp_out.value ? omp_out.value : omp_in.value,\\",
                 "    omp_out.index = omp_in.value > omp_out.value ? omp_out.index : omp_in.index)\\",
-                f"\tinitializer(omp_priv = {{0, {reduction_init(reduction_type, dtype)}}})",
+                f"\tinitializer(omp_priv = {{0, {reduction_init(reduction_type, src_dtype)}}})",
             ]
         )
     return prefix
@@ -100,6 +109,9 @@ def cpp_prefix():
             #include <omp.h>
 
             #include <ATen/core/PhiloxRNGEngine.h>
+            #include <c10/util/Half.h>
+
+            typedef at::Half half;
 
             template<typename T>
             inline T mod(T a, T b) { return a % b; }
@@ -179,6 +191,10 @@ class CppOverrides(OpOverrides):
         return f"std::sqrt({x})"
 
     @staticmethod
+    def rsqrt(x):
+        return f"1 / std::sqrt({x})"
+
+    @staticmethod
     def pow(a, b):
         return f"std::pow({a}, {b})"
 
@@ -195,12 +211,24 @@ class CppOverrides(OpOverrides):
         return f"std::floor({x})"
 
     @staticmethod
+    def floordiv(a, b):
+        # a and b are integer type
+        quot = f"{a} / {b}"
+        rem = f"{a} % {b}"
+        return f"(({a} < 0) != ({b} < 0) ? ({rem} != 0 ? {quot} - 1 : {quot}) : {quot})"
+
+    @staticmethod
     def ceil(x):
         return f"std::ceil({x})"
 
     @staticmethod
     def trunc(x):
         return f"std::trunc({x})"
+
+    @staticmethod
+    def truncdiv(a, b):
+        # a and b are integer type
+        return f"{a} / {b}"
 
     @staticmethod
     def isinf(x):
@@ -293,11 +321,13 @@ class CppKernel(Kernel):
         self.reduction_suffix = DeferredIndentedBuffer()
         self.reduction_vars = {}
 
-    def load(self, name: str, index: sympy.Expr, upcast: bool = False):
-        # upcast argument is ignored on cpu
+    def load(self, name: str, index: sympy.Expr):
         var = self.args.input(name)
         index = self.rename_indexing(index)
-        return self.cse.generate(self.loads, f"{var}[{cexpr(index)}]")
+        line = f"{var}[{cexpr(index)}]"
+        if V.graph.get_dtype(name) in (torch.float16, torch.bfloat16):
+            line = f"static_cast<float>({line})"
+        return self.cse.generate(self.loads, line)
 
     def store(self, name, index, value, mode=None):
         assert "buf" in name
@@ -321,7 +351,7 @@ class CppKernel(Kernel):
             raise NotImplementedError(f"store mode={mode}")
         self.stores.writeline(name, line)
 
-    def reduction(self, name, dtype, reduction_type, index, value):
+    def reduction(self, name, dtype, src_dtype, reduction_type, index, value):
         argmax_or_argmin = reduction_type in {"argmax", "argmin"}
         tmpvar = self.cse.generate(
             self.loads, f"reduction {name} {cexpr(index)}", write=False
@@ -330,7 +360,7 @@ class CppKernel(Kernel):
         self.reduction_vars[tmpvar] = reduction_type
         if argmax_or_argmin:
             self.reduction_prefix.writelines(
-                argmax_argmin_prefix(reduction_type, dtype, tmpvar)
+                argmax_argmin_prefix(reduction_type, src_dtype, tmpvar)
             )
             compare_op = "<" if reduction_type == "argmax" else ">"
             self.stores.writelines(
@@ -379,7 +409,7 @@ class CppKernel(Kernel):
     def codegen_loops(self, code, worksharing):
         threads = config.cpp.threads
         if threads < 1:
-            threads = multiprocessing.cpu_count() // 2
+            threads = multiprocessing.cpu_count()
 
         loops = [LoopLevel(var, size) for var, size in zip(self.itervars, self.ranges)]
         loops, reductions = LoopNest(loops[: self.reduction_depth]), LoopNest(
@@ -393,13 +423,6 @@ class CppKernel(Kernel):
                 reductions.loops[-1].simd = True
             else:
                 loops.loops[-1].simd = True
-
-        # limit thread count for smaller sizes
-        work = self.size_hint()
-        if work < 2**18:
-            threads = min(threads, 4)
-        elif work < 2**22:
-            threads = min(threads, 8)
 
         par_depth = 0
         reduction_par_depth = 0
@@ -485,34 +508,51 @@ class CppScheduling:
     def group_fn(self, sizes):
         return tuple(tuple(map(V.graph.sizevars.simplify, s)) for s in sizes)
 
-    def codegen(self, *groups):
-        group, reduction_group = groups
+    @staticmethod
+    def can_fuse_horizontal(node1, node2):
+        _, (vars1, reduce1) = node1.group
+        _, (vars2, reduce2) = node2.group
+        if vars1 == vars2 and reduce1 == reduce2:
+            return True
+        if reduce1 == () and vars1 == vars2 + reduce2:
+            return True
+        # TODO(jansel): allow fusion pointwise (vars1, ()) suffix?
+        return False
 
+    @classmethod
+    def can_fuse_vertical(cls, node1, node2):
+        return cls.can_fuse_horizontal(node1, node2) and not node1.is_reduction()
+
+    def codegen_nodes(self, nodes):
+        """
+        Turn an set of pre-fused nodes into a C++ kernel.
+        """
         kernel_group = self.kernel_group
         scheduler = self.scheduler
-        with scheduler.kernel(kernel_group.new_kernel()) as kernel:
+        _, (group, reduction_group) = max(
+            nodes, key=lambda x: int(x.is_reduction())
+        ).group
+        in_suffix = False
+
+        with kernel_group.new_kernel() as kernel:
             vars, reduction_vars = kernel.set_ranges(group, reduction_group)
 
-            # first any pointwise sharing same loops
-            for node in scheduler.pop_group((group + reduction_group, ())):
-                node.run(vars, reduction_vars)
-                node.mark_fusable()
-
-            if reduction_group:
-                # reductions
-                reduction_nodes = list(scheduler.pop_group((group, reduction_group)))
-                for node in reduction_nodes:
+            for node in nodes:
+                if node.group[1] in [
+                    (group, reduction_group),
+                    (group + reduction_group, ()),
+                ]:
+                    assert not in_suffix
                     node.run(vars, reduction_vars)
-
-                # can't fuse reduction into reduction, so do in seperate loop
-                for node in reduction_nodes:
-                    node.mark_fusable()
-
-                # we can fuse in some extra pointwise into the suffix
-                with kernel.write_to_suffix():
-                    for node in scheduler.pop_group((group, ())):
+                else:
+                    in_suffix = True
+                    assert node.group[1] == (
+                        group,
+                        (),
+                    ), f"unexpected group: {node.group[1]} != {group}, {reduction_group}"
+                    # we can fuse in some extra pointwise into the suffix
+                    with kernel.write_to_suffix():
                         node.run(vars, ())
-                        node.mark_fusable()
 
         kernel_group.finalize_kernel(kernel, scheduler)
 
@@ -539,11 +579,6 @@ class KernelGroup:
         code = self.loops_code
         ws = self.ws
         new_kernel.codegen_loops(code, ws)
-        if not ws.in_parallel:
-            scheduler.barrier()
-        if not scheduler.runnable_nodes and scheduler.pending_buffer_names:
-            ws.barrier()
-            scheduler.barrier()
 
     def codegen_define_and_call(self, wrapper):
         self.stack.close()
@@ -578,7 +613,6 @@ class WorkSharing:
         self.code = code
         self.in_parallel = False
         self.num_threads = None
-        self.need_barrier = False
         self.stack = contextlib.ExitStack()
 
     def parallel(self, threads):
@@ -588,19 +622,16 @@ class WorkSharing:
         if not self.in_parallel:
             self.num_threads = threads
             self.in_parallel = True
-            self.code.writeline(f"#pragma omp parallel num_threads({threads})")
+            if threads == multiprocessing.cpu_count():
+                self.code.writeline("#pragma omp parallel")
+            else:
+                self.code.writeline(f"#pragma omp parallel num_threads({threads})")
             self.stack.enter_context(self.code.indent())
-        elif self.need_barrier:
-            self.code.writeline("#pragma omp barrier")
-        self.need_barrier = False
 
     def single(self):
         if self.in_parallel:
-            self.code.writeline("#pragma omp single nowait")
+            self.code.writeline("#pragma omp single")
         return self.in_parallel
-
-    def barrier(self):
-        self.need_barrier = True
 
     def close(self):
         self.stack.close()
@@ -642,7 +673,7 @@ class LoopLevel:
         simd = f"simd simdlen({config.cpp.simdlen})"
         if self.parallel:
             # TODO(jansel): look into chunk size and other schedules
-            line1 = f"#pragma omp for nowait{reduction}"
+            line1 = f"#pragma omp for{reduction}"
             if self.parallel > 1:
                 line1 += f" collapse({self.parallel})"
             if self.simd:
@@ -680,4 +711,6 @@ class LoopNest:
     def codegen(self, code, stack):
         for loop in self.loops:
             code.writelines(loop.lines())
+            stack.enter_context(code.indent())
+        else:
             stack.enter_context(code.indent())

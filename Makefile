@@ -9,8 +9,8 @@ CLANG_FORMAT ?= clang-format-10
 PIP ?= python -m pip
 
 # versions used in CI
-PYTORCH_VERSION ?= dev20220826
-TRITON_VERSION ?= 5b04331dd2efdd23f4475823761fa975de60a514
+PYTORCH_VERSION ?= dev20220916
+TRITON_VERSION ?= 889d9e34a114b1fe2e8871d21e713794344d12d3
 
 
 default: develop
@@ -19,7 +19,7 @@ develop:
 	python setup.py develop
 
 test: develop
-	pytest test
+	pytest test -o log_cli=False
 
 torchbench: develop
 	python benchmarks/torchbench.py --fast
@@ -52,7 +52,6 @@ setup:
 setup_nightly:
 	$(PIP) install ninja
 	$(PIP) install --pre torch==1.13.0.$(PYTORCH_VERSION) --extra-index-url https://download.pytorch.org/whl/nightly/cpu
-	$(PIP) install -v "git+https://github.com/pytorch/pytorch.git@`python -c "import torch.version; print(torch.version.git_version)"`#subdirectory=functorch"
 	$(PIP) install -r requirements.txt
 
 setup_nightly_gpu:
@@ -63,7 +62,6 @@ setup_nightly_gpu:
                       torchtext==0.14.0.$(PYTORCH_VERSION) \
                       --extra-index-url https://download.pytorch.org/whl/nightly/cu116
 	$(PIP) install ninja
-	$(PIP) install -v "git+https://github.com/pytorch/pytorch.git@`python -c "import torch.version; print(torch.version.git_version)"`#subdirectory=functorch"
 	$(PIP) install -U "git+https://github.com/openai/triton@$(TRITON_VERSION)#subdirectory=python"
 	$(PIP) install -r requirements.txt
 
@@ -89,7 +87,7 @@ pull-deps:
 	(cd ../torchaudio     && git pull && git submodule update --init --recursive)
 	(cd ../detectron2     && git pull && git submodule update --init --recursive)
 	(cd ../torchbenchmark && git pull && git submodule update --init --recursive)
-	(cd ../triton         && git pull && git submodule update --init --recursive)
+	(cd ../triton         && git checkout master && git pull && git checkout $(TRITON_VERSION) && git submodule update --init --recursive)
 
 build-deps: clone-deps
 	# conda env remove --name torchdynamo
@@ -106,7 +104,6 @@ build-deps: clone-deps
 	(cd ../torchtext   && python setup.py clean && python setup.py develop)
 	(cd ../torchaudio  && python setup.py clean && python setup.py develop)
 	(cd ../detectron2  && python setup.py clean && python setup.py develop)
-	(cd ../pytorch/functorch   && python setup.py clean && python setup.py develop)
 	(cd ../torchbenchmark && python install.py --continue_on_fail)
 	(cd ../triton/python && python setup.py clean && python setup.py develop)
 	make setup_lint

@@ -28,13 +28,16 @@ import importlib
 import io
 import itertools
 import os
+from collections import defaultdict
 from os.path import abspath
 from os.path import exists
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 from matplotlib import rcParams
+from numpy.core.fromnumeric import mean
 from scipy.stats import gmean
 from tabulate import tabulate
 
@@ -48,14 +51,13 @@ DEFAULT_OUTPUT_DIR = "benchmark_logs"
 
 TABLE = {
     "training": {
-        "ts_nnc": "--training --speedup-ts --use-eval-mode ",
-        "ts_nvfuser": "--training --nvfuser --speedup-dynamo-ts --use-eval-mode ",
-        "eager": "--training --backend=eager --use-eval-mode",
-        "aot_eager": "--training --accuracy-aot-nop --generate-aot-autograd-stats --use-eval-mode ",
-        "aot_cudagraphs": "--training --backend=aot_cudagraphs --use-eval-mode ",
-        "aot_nnc": "--training --accuracy-aot-ts-mincut --use-eval-mode ",
-        "aot_nvfuser": "--training --nvfuser --accuracy-aot-ts-mincut --use-eval-mode ",
-        "inductor_cudagraphs": "--training --inductor --use-eval-mode",
+        "ts_nnc": "--training --speedup-ts ",
+        "ts_nvfuser": "--training --nvfuser --speedup-dynamo-ts ",
+        "eager": "--training --backend=eager ",
+        "aot_eager": "--training --backend=aot_eager ",
+        "aot_cudagraphs": "--training --backend=aot_cudagraphs ",
+        "aot_nvfuser": "--training --nvfuser --backend=aot_nvfuser ",
+        "inductor_cudagraphs": "--training --inductor --skip-accuracy-check ",  # TODO - remove skip-accuracy-check
     },
     "inference": {
         "ts_nnc": "--speedup-ts",
@@ -68,7 +70,7 @@ TABLE = {
         "pytorch": "--training --profile-backend=pytorch",
         "eager": "--training --profile-backend=eager",
         "ts_nvfuser": "--training --profile-backend=nvfuser",
-        "aot_eager": "--training --profile-backend=aot_nop",
+        "aot_eager": "--training --profile-backend=aot_eager",
         "aot_nvfuser": "--training --profile-backend=aot_nvfuser",
         "inductor_cudagraphs": "--training --profile-backend=inductor",
     },
@@ -101,10 +103,17 @@ DEFAULTS = {
     "devices": [
         "cuda",
     ],
+    "quick": {
+        "torchbench": '-k "resnet..$"',
+        "huggingface": "-k Albert",
+        "timm_models": ' -k "^resnet" -k "^inception"',
+    },
 }
 
 
 def percentage(part, whole, decimals=2):
+    if whole == 0:
+        return 0
     return round(100 * float(part) / float(whole), decimals)
 
 
@@ -208,38 +217,34 @@ def generate_commands(args, dtypes, suites, devices, compilers, output_dir):
         lines.append(f"mkdir {output_dir}")
         lines.append("")
 
-        for iter in itertools.product(suites, devices, dtypes):
-            suite, device, dtype = iter
-            lines.append(
-                f"# Commands for {suite} for device={device}, dtype={dtype} for {mode}"
-            )
-            info = TABLE[mode]
-            for compiler in compilers:
-                base_cmd = info[compiler]
-                output_filename = (
-                    f"{output_dir}/{compiler}_{suite}_{dtype}_{mode}_{device}.csv"
+        for testing in ["performance", "accuracy"]:
+            for iter in itertools.product(suites, devices, dtypes):
+                suite, device, dtype = iter
+                lines.append(
+                    f"# Commands for {suite} for device={device}, dtype={dtype} for {mode} and for {testing} testing"
                 )
-                cmd = f"python benchmarks/{suite}.py --{dtype} -d{device} --no-skip --output={output_filename} --quiet"
-                cmd = f"{cmd} {base_cmd}"
-                if args.profile_compiler:
-                    cmd = f"{cmd} --raise-on-assertion-error --raise-on-backend-error"
-
-                skip_tests_str = get_skip_tests(suite)
-                cmd = f"{cmd} {skip_tests_str}"
-
-                if args.quick:
-                    if suite == "torchbench":
-                        cmd = f"{cmd} --only=resnet18"
-                    elif suite == "huggingface":
-                        cmd = f"{cmd} --only=BertForPreTraining_P1_bert"
-                    else:
-                        raise NotImplementedError(
-                            f"Quick not implemented for {suite}.py"
+                info = TABLE[mode]
+                for compiler in compilers:
+                    base_cmd = info[compiler]
+                    output_filename = f"{output_dir}/{compiler}_{suite}_{dtype}_{mode}_{device}_{testing}.csv"
+                    cmd = f"python benchmarks/{suite}.py --{testing} --{dtype} -d{device} --output={output_filename}"
+                    cmd = f"{cmd} {base_cmd} --no-skip --quiet"
+                    if args.profile_compiler:
+                        cmd = (
+                            f"{cmd} --raise-on-assertion-error --raise-on-backend-error"
                         )
-                if args.log_operator_inputs:
-                    cmd = f"{cmd} --log-operator-inputs"
-                lines.append(cmd)
-            lines.append("")
+
+                    skip_tests_str = get_skip_tests(suite)
+                    cmd = f"{cmd} {skip_tests_str}"
+
+                    if args.log_operator_inputs:
+                        cmd = f"{cmd} --log-operator-inputs"
+
+                    if args.quick:
+                        filters = DEFAULTS["quick"][suite]
+                        cmd = f"{cmd} {filters}"
+                    lines.append(cmd)
+                lines.append("")
         runfile.writelines([line + "\n" for line in lines])
 
 
@@ -443,7 +448,9 @@ class ParseCompilerProfileLogs(Parser):
 class ParsePerformanceLogs(Parser):
     def __init__(self, suites, devices, dtypes, compilers, mode, output_dir):
         super().__init__(suites, devices, dtypes, compilers, mode, output_dir)
-        self.parsed_frames = {}
+        self.parsed_frames = defaultdict(lambda: defaultdict(None))
+        self.metrics = ["speedup", "start_latency", "peak_memory"]
+        self.bottom_k = 50
         self.parse()
 
     def plot_graph(self, df, title):
@@ -470,15 +477,26 @@ class ParsePerformanceLogs(Parser):
         else:
             return pd.read_csv(
                 output_filename,
-                names=["dev", "name", "batch_size", "speedup"],
+                names=[
+                    "dev",
+                    "name",
+                    "batch_size",
+                    "speedup",
+                    "start_latency",
+                    "peak_memory",
+                ],
                 header=None,
             )
 
     def parse(self):
-        self.extract_df()
+        self.extract_df("accuracy", "accuracy")
+        for metric in self.metrics:
+            self.extract_df(metric, "performance")
         self.generate_executive_summary()
         for suite in self.suites:
-            self.plot_graph(self.parsed_frames[suite], f"{suite}_{self.dtypes[0]}")
+            self.plot_graph(
+                self.parsed_frames[suite]["speedup"], f"{suite}_{self.dtypes[0]}"
+            )
 
     def clean_batch_sizes(self, frames):
         # Clean up batch sizes when its 0
@@ -498,14 +516,15 @@ class ParsePerformanceLogs(Parser):
             frame["batch_size"] = batch_sizes
         return frames
 
-    def extract_df(self):
+    def extract_df(self, metric, testing):
         for iter in itertools.product(self.suites, self.devices, self.dtypes):
             suite, device, dtype = iter
             frames = []
             for compiler in self.compilers:
-                output_filename = f"{self.output_dir}/{compiler}_{suite}_{dtype}_{self.mode}_{device}.csv"
+                output_filename = f"{self.output_dir}/{compiler}_{suite}_{dtype}_{self.mode}_{device}_{testing}.csv"
                 df = self.read_csv(output_filename)
-                df.rename(columns={"speedup": compiler}, inplace=True)
+                df = df[["dev", "name", "batch_size", metric]]
+                df.rename(columns={metric: compiler}, inplace=True)
                 df["batch_size"] = df["batch_size"].astype(int)
                 frames.append(df)
 
@@ -519,11 +538,30 @@ class ParsePerformanceLogs(Parser):
                 for idx in range(2, len(frames)):
                     df = pd.merge(df, frames[idx], on=["dev", "name", "batch_size"])
 
+            if testing == "performance":
+                df_accuracy = self.parsed_frames[suite]["accuracy"]
+                perf_rows = []
+                for model_name in df["name"]:
+                    perf_row = df[df["name"] == model_name]
+                    acc_row = df_accuracy[df_accuracy["name"] == model_name]
+                    for compiler in self.compilers:
+                        if acc_row[compiler].iloc[0] != "pass":
+                            perf_row[compiler].iloc[0] = 0.0
+                    perf_rows.append(perf_row)
+                df = pd.concat(perf_rows)
             df = df.sort_values(by=list(reversed(self.compilers)), ascending=False)
-            self.parsed_frames[suite] = df
+            self.parsed_frames[suite][metric] = df
+
+    def comp_time(self, compiler, df):
+        df = df[compiler][df[compiler] > 0]
+        # df = df.sort_values(by=compiler, ascending=False)[compiler][: self.bottom_k]
+        return f"{mean(df):.2f}"
 
     def geomean(self, compiler, df):
-        return f"{round(gmean(df[compiler][df[compiler] > 0].clip(1)), 2)}x"
+        cleaned_df = df[compiler][df[compiler] > 0].clip(1)
+        if cleaned_df.empty:
+            return "0.0x"
+        return f"{gmean(cleaned_df):.2f}x"
 
     def passrate(self, compiler, df):
         total = len(df.index)
@@ -531,23 +569,32 @@ class ParsePerformanceLogs(Parser):
         perc = int(percentage(passing, total, decimals=0))
         return f"{perc}%, {passing}/{total}"
 
-    def exec_summary_df(self, fn):
+    def memory(self, compiler, df):
+        cr = df["eager"] / df[compiler]
+        cr.replace(np.inf, 0, inplace=True)
+        cr = cr.fillna(0)
+        cr = cr[cr > 0]
+        return f"{gmean(cr):.2f}"
+
+    def exec_summary_df(self, fn, metric):
         """
         Generate a table with passrate and geomean perf
         """
         cols = {}
         cols["Compiler"] = self.compilers
         for suite in self.suites:
-            df = self.parsed_frames[suite]
+            df = self.parsed_frames[suite][metric]
             # speedups = [self.geomean(compiler, df) for compiler in self.compilers]
             speedups = [fn(compiler, df) for compiler in self.compilers]
             col = pd.Series(data=speedups, index=self.compilers)
             cols[suite] = col
         df = pd.DataFrame(cols)
+        df = df.fillna(0)
+        df.to_csv(os.path.join(self.output_dir, f"{fn.__name__}.csv"))
         return df
 
-    def exec_summary_text(self, caption, fn):
-        df = self.exec_summary_df(fn)
+    def exec_summary_text(self, caption, fn, metric):
+        df = self.exec_summary_df(fn, metric)
         tabform = tabulate(df, headers="keys", tablefmt="pretty", showindex="never")
 
         str_io = io.StringIO()
@@ -562,44 +609,69 @@ class ParsePerformanceLogs(Parser):
         str_io.write("\n")
         str_io.write("## Executive Summary ##\n")
         description = (
-            "Majority of our efforts are currently on improving the correctness and "
-            "performance on OSS training models - torchbench, huggingface and timm models. "
-            "This is the current performance and accuracy numbers for the float32 and float16 "
-            "precision.\n"
-            "For measuring accuracy, we show the accuracy pass rate, i.e., "
-            "percentage of models passing numerical checks for forward pass outputs and "
-            "gradients.\n"
-            "For performance, we use geometric mean speedup normalized to Pytorch "
-            "eager, which is calculated by clipping the individual speedups at 1.0x. We skip "
-            "the failing models during the gmean calculation. This essentially represents "
-            '"speedups we expect once we fixed the failures, assuming similar distribution". '
-            "All of our experiments are on A100 GPUs.\n\n"
+            "This table shows the accuracy and performance numbers for different backends "
+            "across three benchmark suites - torchbench, huggingface and timm. We run "
+            "these experiments on A100 GPUs. Each experiment runs one iteration of forward "
+            "and backward pass. For accuracy, we check the numerical correctness of forward "
+            "pass outputs and gradients by comparing with native pytorch. We measure speedup "
+            "by normalizing against the performance of native pytorch. We also report compilation "
+            f"time metric which is mean of worst {self.bottom_k} compilation models.\n\n"
+            "Caveats\n"
+            "1) Batch size has been reduced to workaround OOM errors. Work is in progress to "
+            "reduce peak memory footprint.\n"
+            "2) Experiments do not cover dynamic shapes.\n"
+            "3) Experimental setup does not have optimizer.\n\n"
         )
         str_io.write(description)
 
-        speedup_caption = (
-            f"Geometric mean speedup for {self.dtypes[0]} precision on A100 GPU\n"
+        speedup_caption = "Geometric mean speedup\n"
+        speedup_summary = self.exec_summary_text(
+            speedup_caption, self.geomean, "speedup"
         )
-        speedup_summary = self.exec_summary_text(speedup_caption, self.geomean)
 
-        passrate_caption = f"Passrate for {self.dtypes[0]} precision on A100 GPU\n"
-        passrate_summary = self.exec_summary_text(passrate_caption, self.passrate)
+        passrate_caption = "Passrate\n"
+        passrate_summary = self.exec_summary_text(
+            passrate_caption, self.passrate, "speedup"
+        )
+
+        comp_time_caption = "Mean compilation time (seconds)\n"
+        comp_time_summary = self.exec_summary_text(
+            comp_time_caption, self.comp_time, "start_latency"
+        )
+
+        peak_memory_caption = 'WIP Peak memory footprint reduction ratio normalized to torchdynamo("eager")\n'
+        peak_memory_summary = self.exec_summary_text(
+            peak_memory_caption, self.memory, "peak_memory"
+        )
 
         str_io.write(passrate_summary)
         str_io.write(speedup_summary)
+        str_io.write(comp_time_summary)
+        str_io.write(peak_memory_summary)
         self.executive_summary = str_io.getvalue()
 
     def prepare_message(self, suite):
         title = f"## {suite} suite with {self.dtypes[0]} precision ##"
-        df = self.parsed_frames[suite]
-        df = df.drop("dev", axis=1)
-        tabform = tabulate(df, headers="keys", tablefmt="pretty", showindex="never")
-        str_io = io.StringIO()
-        str_io.write("\n")
-        str_io.write("~~~\n")
-        str_io.write(f"{tabform}\n")
-        str_io.write("~~~\n")
-        body = str_io.getvalue()
+        body = ""
+        for metric in ["speedup", "accuracy", "start_latency", "peak_memory"]:
+            df = self.parsed_frames[suite][metric]
+            df = df.drop("dev", axis=1)
+            tabform = tabulate(df, headers="keys", tablefmt="pretty", showindex="never")
+            str_io = io.StringIO()
+            str_io.write("\n")
+            if metric == "speedup":
+                str_io.write("Performance speedup\n")
+            elif metric == "accuracy":
+                str_io.write("Accuracy\n")
+            elif metric == "start_latency":
+                str_io.write("Compilation latency (sec)\n")
+            elif metric == "peak_memory":
+                str_io.write("Peak Memory footprint (GBs)\n")
+            str_io.write("~~~\n")
+            str_io.write(f"{tabform}\n")
+            str_io.write("~~~\n")
+            body += str_io.getvalue()
+
         comment = generate_dropdown_comment(title, body)
         return comment
 

@@ -7,6 +7,8 @@ from types import ModuleType
 
 import torch
 
+import torchdynamo.utils
+
 try:
     import torch._prims
     import torch._refs
@@ -21,7 +23,12 @@ except ImportError:
 # INFO print compiled functions + graphs
 # WARN print warnings (including graph breaks)
 # ERROR print exceptions (and what user code was being processed when it occurred)
+# NOTE: changing log_level will automatically update the levels of all torchdynamo loggers
 log_level = logging.WARNING
+
+# the name of a file to write the logs to
+log_file_name = None
+
 # Verbose will print full stack traces on warnings and errors
 verbose = False
 
@@ -99,12 +106,16 @@ allowed_functions_module_string_ignorelist = {
     "torch._decomp",
 }
 
+# Debug Flag to try minifier at different stages. Possible values are {None, "aot", "dynamo"}
+# None - Minifier is switched off
+# dynamo - Runs minifier on the TorchDynamo produced graphs, if compilation fails
+# aot - Runs minifier on the Aot Autograd produced graphs, if compilation fails
+repro_after = os.environ.get("TORCHDYNAMO_REPRO_AFTER", None)
 # Compiler compilation debug info
-# 0: Nothing printed out when compilation fails
-# 1: Dump the graph out to repro.py if compilation fails
-# 2: Dumps the graph out to minify_repro.py with a minifier if compilation fails
-# 3: Always dumps the last graph ran out to minify_repro.py, useful for segfaults/irrecoverable errors
-repro_level = int(os.environ.get("COMPILER_REPRO_LEVEL", 0))
+# 1: Dumps the original graph out to repro.py/repro.tar.gz if compilation fails
+# 2: Either 1) Dumps the original graph out to minify_repro.py with a minifier if compilation fails
+#        or 2) Minifies and dumps the minified graph to repro.py/repro.tar.gz if compilation fails
+repro_level = int(os.environ.get("TORCHDYNAMO_REPRO_LEVEL", 2))
 
 # Not all backends support scalars. Some calls on torch.Tensor (like .item()) return a scalar type.
 # When this flag is set to False, we introduce a graph break instead of capturing.
@@ -114,11 +125,22 @@ capture_scalar_outputs = False
 # false_fn produces code with identical guards.
 enforce_cond_guards_match = True
 
+# Automatically split model graph into pieces to match DDP bucket sizes
+# to allow DDP comm/compute overlap
+optimize_ddp = False
+
+
+# If True, raises exception if TorchDynamo is called with a context manager
+raise_on_ctx_manager_usage = True
+
 
 class _AccessLimitingConfig(ModuleType):
     def __setattr__(self, name, value):
         if name not in _allowed_config_names:
             raise AttributeError(f"{__name__}.{name} does not exist")
+        # automatically set logger level whenever config.log_level is modified
+        if name == "log_level":
+            torchdynamo.utils.set_loggers_level(value)
         return object.__setattr__(self, name, value)
 
 

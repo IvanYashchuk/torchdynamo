@@ -122,7 +122,7 @@ def wrap_convert_context(fn):
 @TorchPatcher.suppress_torch_distributed_warnings
 def has_tensor_in_frame(frame):
     """Check if the frame has torch.* related bits"""
-    # Check if the function was decorated with torchdynamo.optimize
+    # Check if the function was decorated using torchdynamo.optimize
     if frame.f_code in always_optimize_code_objects:
         return True
 
@@ -215,7 +215,9 @@ def format_error_msg(exc, frame):
     return msg
 
 
-def convert_frame_assert(compiler_fn: Callable, guard_export_fn=None, one_graph=True):
+def convert_frame_assert(
+    compiler_fn: Callable, guard_export_fn=None, one_graph=True, export=False
+):
     """Fully convert a frame into an FX graph"""
     init_logging()
 
@@ -294,6 +296,7 @@ def convert_frame_assert(compiler_fn: Callable, guard_export_fn=None, one_graph=
                 code_options,
                 compiler_fn,
                 one_graph,
+                export,
             )
             tracer.run()
             output = tracer.output

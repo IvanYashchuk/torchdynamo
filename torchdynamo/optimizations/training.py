@@ -145,6 +145,12 @@ class AotNop(AotAutogradStrategy):
 
 aot_eager = AotNop.compile_fn
 
+def cudagraphify_ts(gm, inputs):
+    from functorch.compile import ts_compile
+    from torchinductor.compile_fx import cudagraphify
+    ts = ts_compile(gm, inputs)
+    ts_ = lambda *args: ts(args)
+    return cudagraphify(ts_, inputs)
 
 class AotTorchscript(AotAutogradStrategy):
     """
@@ -155,7 +161,7 @@ class AotTorchscript(AotAutogradStrategy):
         from functorch.compile import ts_compile
 
         return BACKENDS["aot_autograd"](
-            self.gm, self.example_inputs, fw_compiler=ts_compile
+            self.gm, self.example_inputs, fw_compiler=cudagraphify_ts
         )
 
 
@@ -188,8 +194,8 @@ def mem_efficient_fusion_kwargs(use_decomps):
 
     kwargs = {
         # these are taken from memory_efficient_fusion()
-        "fw_compiler": ts_compile,
-        "bw_compiler": ts_compile,
+        "fw_compiler": cudagraphify_ts,
+        "bw_compiler": cudagraphify_ts,
         "partition_fn": min_cut_rematerialization_partition,
     }
 
@@ -328,6 +334,7 @@ def prims_executor(gm, inputs, *, executor):
     from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch._prims.executor import execute
     from torch.fx.experimental.proxy_tensor import make_fx
+    from torchinductor.compile_fx import cudagraphify
 
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor
@@ -335,7 +342,8 @@ def prims_executor(gm, inputs, *, executor):
         prim_gm = make_fx(gm)(*inputs)
 
     # Then we return a callable that executes the "prim_gm" graph
-    return partial(execute, prim_gm, executor=executor)
+    # return partial(execute, prim_gm, executor=executor)
+    return cudagraphify(partial(execute, prim_gm, executor=executor), inputs)
 
 
 def create_nvprims_backend(*, executor):

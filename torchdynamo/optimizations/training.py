@@ -277,7 +277,8 @@ def prims_executor(gm, inputs, *, executor):
         prim_gm = make_fx(gm)(*inputs)
 
     # Then we return a callable that executes the "prim_gm" graph
-    return partial(execute, prim_gm, executor=executor)
+    params = {"allow_single_op_fusion": False}
+    return partial(execute, prim_gm, executor=executor, executor_parameters=params)
 
 
 def create_nvprims_backend(*, executor):

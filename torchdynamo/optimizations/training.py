@@ -271,10 +271,15 @@ def prims_executor(gm, inputs, *, executor):
     from torch._prims.executor import execute
     from torch.fx.experimental.proxy_tensor import make_fx
 
+    decomp = {
+        torch.ops.aten.detach.default: torch.ops.nvprims.view_of.default,
+        torch.ops.aten.clone.default: torch.ops.nvprims.view_of.default,
+    }
+
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor
     with TorchRefsNvfuserCapabilityMode():
-        prim_gm = make_fx(gm)(*inputs)
+        prim_gm = make_fx(gm, decomposition_table=decomp)(*inputs)
 
     # Then we return a callable that executes the "prim_gm" graph
     return partial(execute, prim_gm, executor=executor)

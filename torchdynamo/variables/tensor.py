@@ -20,9 +20,8 @@ if fake_tensors_available:
     from torch._subclasses.fake_tensor import DataDependentOutputException
     from torch._subclasses.fake_tensor import DynamicOutputShapeException
 
-
+import torch.utils._python_dispatch as py_dispatch
 from torch.fx.immutable_collections import immutable_list
-from torch.utils._python_dispatch import enable_torch_dispatch_mode
 from torch.utils._pytree import tree_map
 
 from torchdynamo.guards import GuardBuilder
@@ -83,7 +82,7 @@ class TensorVariable(VariableTracker):
 
     @classmethod
     def create(cls, tx, proxy, example_value=None, nnmodule=None, **options):
-        if "guards" in options:
+        if "guards" in options and options["guards"] is not None:
             tx.output.guards.update(options["guards"])
 
         assert "example_value" not in proxy.node.meta
@@ -118,7 +117,10 @@ class TensorVariable(VariableTracker):
                         nnmodule = deepcopy_to_fake_tensor(nnmodule, tx.fake_mode)
 
                     def context():
-                        return enable_torch_dispatch_mode(tx.fake_mode)
+                        if hasattr(py_dispatch, "enable_torch_dispatch_mode"):
+                            return py_dispatch.enable_torch_dispatch_mode(tx.fake_mode)
+                        else:
+                            return tx.fake_mode
 
                 else:
                     context = contextlib.nullcontext
@@ -368,7 +370,7 @@ class TensorVariable(VariableTracker):
         # In some cases, a <tensor>.<attr> guard can be evaluated first, and break if
         # <tensor> is later changed to another type
         if result is not None and self.source is not None:
-            result = result.add_guard(self.create_guard(GuardBuilder.TYPE_MATCH))
+            result = result.add_guard(self.make_guard(GuardBuilder.TYPE_MATCH))
 
         if result is None:
             raise NotImplementedError()

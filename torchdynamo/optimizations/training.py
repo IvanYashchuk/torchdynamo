@@ -273,7 +273,6 @@ def prims_executor(gm, inputs, *, executor):
 
     decomp = {
         torch.ops.aten.detach.default: torch.ops.nvprims.view_of.default,
-        torch.ops.aten.clone.default: torch.ops.nvprims.view_of.default,
     }
 
     # First we trace the graph conditionally decomposing nodes

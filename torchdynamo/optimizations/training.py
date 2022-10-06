@@ -84,12 +84,12 @@ class AotNop(AotAutogradStrategy):
 
 aot_eager = AotNop.compile_fn
 
-def cudagraphify_ts(gm, inputs):
+def cudagraphify_ts(gm, inputs, num_fixed=0):
     from functorch.compile import ts_compile
     from torchinductor.compile_fx import cudagraphify
     ts = ts_compile(gm, inputs)
     ts_ = lambda *args: ts(args)
-    return cudagraphify(ts_, inputs)
+    return cudagraphify(ts_, inputs, range(num_fixed))
 
 class AotTorchscript(AotAutogradStrategy):
     """
@@ -131,10 +131,15 @@ def mem_efficient_fusion_kwargs(use_decomps):
     from functorch.compile import min_cut_rematerialization_partition
     from functorch.compile import ts_compile
 
+    def bw_compiler(model: torch.fx.GraphModule, example_inputs):
+        from torchinductor.compile_fx import count_tangents
+        num_fixed = count_tangents(model)
+        return partial(cudagraphify_ts, num_fixed=num_fixed)(model, example_inputs)
+
     kwargs = {
         # these are taken from memory_efficient_fusion()
         "fw_compiler": cudagraphify_ts,
-        "bw_compiler": cudagraphify_ts,
+        "bw_compiler": bw_compiler,
         "partition_fn": min_cut_rematerialization_partition,
     }
 

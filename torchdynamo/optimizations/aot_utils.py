@@ -1,6 +1,12 @@
+import logging
+import torch
+
+import torchdynamo
 from torchdynamo import config
 
 from .analysis import has_mutation
+
+log = logging.getLogger(__name__)
 
 def is_aot_autograd_safe_to_run(gm, example_inputs):
     """

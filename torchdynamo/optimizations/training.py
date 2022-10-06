@@ -287,7 +287,8 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
 
     # Then we return a callable that executes the "prim_gm" graph
     # return partial(execute, prim_gm, executor=executor)
-    return cudagraphify(partial(execute, prim_gm, executor=executor), inputs, range(num_fixed))
+    params = {"allow_single_op_fusion": False}
+    return cudagraphify(partial(execute, prim_gm, executor=executor, executor_parameters=params), inputs, range(num_fixed))
 
 
 def create_nvprims_backend(*, executor):

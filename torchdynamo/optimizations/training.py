@@ -266,7 +266,7 @@ class AotPrimsNvfuser(AotAutogradStrategy):
 aot_prims_nvfuser = AotPrimsNvfuser.compile_fn
 
 
-def prims_executor(gm, inputs, *, executor):
+def prims_executor(gm, inputs, *, executor, num_fixed=0):
     # This function is called once per forward/backward pass of a graph in AOT
     # Autograd. We use it to set up the nvFuser-specific FX graph and return
     # execute function.
@@ -282,7 +282,7 @@ def prims_executor(gm, inputs, *, executor):
 
     # Then we return a callable that executes the "prim_gm" graph
     # return partial(execute, prim_gm, executor=executor)
-    return cudagraphify(partial(execute, prim_gm, executor=executor), inputs)
+    return cudagraphify(partial(execute, prim_gm, executor=executor), inputs, range(num_fixed))
 
 
 def create_nvprims_backend(*, executor):
@@ -292,11 +292,16 @@ def create_nvprims_backend(*, executor):
             self.executor = executor
 
         def candidate(self):
+            def bw_compiler(model: torch.fx.GraphModule, example_inputs):
+                from torchinductor.compile_fx import count_tangents
+                num_fixed = count_tangents(model)
+                return partial(prims_executor, executor=self.executor, num_fixed=num_fixed)(model, example_inputs)
+
             return BACKENDS["aot_autograd"](
                 self.gm,
                 self.example_inputs,
                 fw_compiler=partial(prims_executor, executor=self.executor),
-                bw_compiler=partial(prims_executor, executor=self.executor),
+                bw_compiler=bw_compiler,
             )
 
     return NvPrims

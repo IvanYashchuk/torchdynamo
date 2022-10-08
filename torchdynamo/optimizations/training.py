@@ -296,8 +296,13 @@ def create_nvprims_backend(*, executor):
         def __init__(self, gm: torch.fx.GraphModule, example_inputs):
             super(NvPrims, self).__init__(gm, example_inputs)
             self.executor = executor
+            self.num_example_inputs = len(example_inputs)
 
         def candidate(self):
+            def fw_compiler(model: torch.fx.GraphModule, example_inputs):
+                num_fixed = len(example_inputs) - self.num_example_inputs
+                return partial(prims_executor, executor=self.executor, num_fixed=num_fixed)(model, example_inputs)
+
             def bw_compiler(model: torch.fx.GraphModule, example_inputs):
                 from torchinductor.compile_fx import count_tangents
                 num_fixed = count_tangents(model)
@@ -306,7 +311,7 @@ def create_nvprims_backend(*, executor):
             return BACKENDS["aot_autograd"](
                 self.gm,
                 self.example_inputs,
-                fw_compiler=partial(prims_executor, executor=self.executor),
+                fw_compiler=fw_compiler,
                 bw_compiler=bw_compiler,
             )
 

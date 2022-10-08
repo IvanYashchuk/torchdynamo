@@ -470,23 +470,39 @@ def apply_cuda_graphs(gm):
             submod = gm.get_submodule(n.target)
             gm.delete_submodule(n.target)
             mutated_inputs = find_input_mutations(submod.graph)
-            gm.register_attr_or_module(
+            gm.add_module(
                 n.target, CudaGraphModule(submod, mutated_inputs)
             )
     # NB: we didn't actually change the graph, no need for recompile
 
 
-def cudagraphs(model, inputs):
+def old_cudagraphs(model, inputs):
     model = partition_cudagraphs(model, inputs)
     apply_cuda_graphs(model)
     return model
 
+def cudagraphs(model, inputs, num_fixed):
+    from torchinductor.compile_fx import align_inputs, cudagraphify
+    compiled_fn = cudagraphify(
+        model, inputs, static_input_idxs=range(num_fixed)
+    )
+    return align_inputs(model, inputs, range(num_fixed))
 
-def raw_aot_autograd_cudagraphs(model, inputs):
+def raw_aot_autograd_cudagraphs(model, example_inputs_):
+    num_example_inputs = len(example_inputs_)
+
+    def fw_compiler(model: torch.fx.GraphModule, example_inputs):
+        fixed = len(example_inputs) - num_example_inputs
+        return cudagraphs(model, example_inputs, num_fixed=fixed)
+
+    def bw_compiler(model: torch.fx.GraphModule, example_inputs):
+        from torchinductor.compile_fx import count_tangents
+        num_fixed = count_tangents(model)
+        return cudagraphs(model, example_inputs, num_fixed=num_fixed)
+
     kwargs = {
-        # these are taken from memory_efficient_fusion()
-        "fw_compiler": cudagraphs,
-        "bw_compiler": cudagraphs,
+        "fw_compiler": fw_compiler,
+        "bw_compiler": bw_compiler,
     }
 
     def _wrapped_bw_compiler(*args, **kwargs):

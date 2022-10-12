@@ -354,7 +354,7 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
     from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch._prims.executor import execute
     from torch.fx.experimental.proxy_tensor import make_fx
-    from torchinductor.compile_fx import cudagraphify
+    from torchinductor.compile_fx import align_inputs, cudagraphify
 
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor
@@ -368,7 +368,9 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
     if has_incompatible_cudagraph_ops(prim_gm):
         return run
 
-    return cudagraphify(run, inputs, range(num_fixed))
+    compiled_fn = cudagraphify(run, inputs, range(num_fixed))
+    result = align_inputs(compiled_fn, inputs, range(num_fixed))
+    return result
 
 
 def create_nvprims_backend(*, executor):

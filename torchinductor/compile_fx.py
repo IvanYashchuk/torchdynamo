@@ -27,7 +27,7 @@ ALIGNMENT = 16
 
 aot_autograd = dynamo_optimizations.backends.aot_autograd
 normalize_ir = dynamo_optimizations.normalize.normalize_ir
-is_aot_autograd_safe_to_run = dynamo_optimizations.aot_utils.is_aot_autograd_safe_to_run
+is_aot_autograd_safe_to_run = dynamo_optimizations.training.is_aot_autograd_safe_to_run
 
 
 @dataclasses.dataclass

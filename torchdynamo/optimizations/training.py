@@ -332,6 +332,21 @@ class AotPrimsNvfuser(AotAutogradStrategy):
 aot_prims_nvfuser = AotPrimsNvfuser.compile_fn
 
 
+def has_incompatible_cudagraph_ops(gm):
+    from torchinductor.utils import has_incompatible_cudagraph_ops as has_incompatible_cudagraph_ops_inductor
+    result = has_incompatible_cudagraph_ops_inductor(gm)
+    if result:
+        return result
+
+    incompatible = [
+        "aten.index_put.default",
+    ]
+    for node in gm.graph.nodes:
+        if str(node.target) in incompatible:
+            return True
+    return False
+
+
 def prims_executor(gm, inputs, *, executor, num_fixed=0):
     # This function is called once per forward/backward pass of a graph in AOT
     # Autograd. We use it to set up the nvFuser-specific FX graph and return
@@ -349,7 +364,11 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
     # Then we return a callable that executes the "prim_gm" graph
     # return partial(execute, prim_gm, executor=executor)
     params = {"allow_single_op_fusion": False}
-    return cudagraphify(partial(execute, prim_gm, executor=executor, executor_parameters=params), inputs, range(num_fixed))
+    run = partial(execute, prim_gm, executor=executor, executor_parameters=params)
+    if has_incompatible_cudagraph_ops(prim_gm):
+        return run
+
+    return cudagraphify(run, inputs, range(num_fixed))
 
 
 def create_nvprims_backend(*, executor):

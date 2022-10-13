@@ -332,8 +332,6 @@ def prims_executor(gm, inputs, *, executor):
     from torch._prims.executor import execute
     from torch.fx.experimental.proxy_tensor import make_fx
 
-    print("printing graph:\n", gm.graph)
-
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor
     with TorchRefsNvfuserCapabilityMode():

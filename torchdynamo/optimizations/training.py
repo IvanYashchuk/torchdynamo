@@ -148,6 +148,12 @@ class AotNop(AotAutogradStrategy):
 
 aot_eager = AotNop.compile_fn
 
+def cudagraphify_ts(gm, inputs, num_fixed=0):
+    from functorch.compile import ts_compile
+    from torchinductor.compile_fx import cudagraphify
+    ts = ts_compile(gm, inputs)
+    ts_ = lambda *args: ts(args)
+    return cudagraphify(ts_, inputs, range(num_fixed))
 
 class AotTorchscript(AotAutogradStrategy):
     """
@@ -158,7 +164,7 @@ class AotTorchscript(AotAutogradStrategy):
         from functorch.compile import ts_compile
 
         return BACKENDS["aot_autograd"](
-            self.gm, self.example_inputs, fw_compiler=ts_compile
+            self.gm, self.example_inputs, fw_compiler=cudagraphify_ts
         )
 
 
@@ -189,10 +195,15 @@ def mem_efficient_fusion_kwargs(use_decomps):
     from functorch.compile import min_cut_rematerialization_partition
     from functorch.compile import ts_compile
 
+    def bw_compiler(model: torch.fx.GraphModule, example_inputs):
+        from torchinductor.compile_fx import count_tangents
+        num_fixed = count_tangents(model)
+        return partial(cudagraphify_ts, num_fixed=num_fixed)(model, example_inputs)
+
     kwargs = {
         # these are taken from memory_efficient_fusion()
-        "fw_compiler": ts_compile,
-        "bw_compiler": ts_compile,
+        "fw_compiler": cudagraphify_ts,
+        "bw_compiler": bw_compiler,
         "partition_fn": min_cut_rematerialization_partition,
     }
 
@@ -324,13 +335,29 @@ class AotPrimsNvfuser(AotAutogradStrategy):
 aot_prims_nvfuser = AotPrimsNvfuser.compile_fn
 
 
-def prims_executor(gm, inputs, *, executor):
+def has_incompatible_cudagraph_ops(gm):
+    from torchinductor.utils import has_incompatible_cudagraph_ops as has_incompatible_cudagraph_ops_inductor
+    result = has_incompatible_cudagraph_ops_inductor(gm)
+    if result:
+        return result
+
+    incompatible = [
+        "aten.index_put.default",
+    ]
+    for node in gm.graph.nodes:
+        if str(node.target) in incompatible:
+            return True
+    return False
+
+
+def prims_executor(gm, inputs, *, executor, num_fixed=0):
     # This function is called once per forward/backward pass of a graph in AOT
     # Autograd. We use it to set up the nvFuser-specific FX graph and return
     # execute function.
     from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch._prims.executor import execute
     from torch.fx.experimental.proxy_tensor import make_fx
+    from torchinductor.compile_fx import align_inputs, cudagraphify
 
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor
@@ -338,7 +365,15 @@ def prims_executor(gm, inputs, *, executor):
         prim_gm = make_fx(gm)(*inputs)
 
     # Then we return a callable that executes the "prim_gm" graph
-    return partial(execute, prim_gm, executor=executor)
+    # return partial(execute, prim_gm, executor=executor)
+    params = {"allow_single_op_fusion": False}
+    run = partial(execute, prim_gm, executor=executor, executor_parameters=params)
+    if has_incompatible_cudagraph_ops(prim_gm):
+        return run
+
+    compiled_fn = cudagraphify(run, inputs, range(num_fixed))
+    result = align_inputs(compiled_fn, inputs, range(num_fixed))
+    return result
 
 @register_decomposition(torch.ops.aten.convolution)
 def convolution(
@@ -411,6 +446,7 @@ def create_nvprims_backend(*, executor):
         def __init__(self, gm: torch.fx.GraphModule, example_inputs):
             super(NvPrims, self).__init__(gm, example_inputs)
             self.executor = executor
+            self.num_example_inputs = len(example_inputs)
 
             aten = torch.ops.aten
             default_decompositions = {
@@ -420,11 +456,20 @@ def create_nvprims_backend(*, executor):
             self.aten2aten_decompositions = get_decompositions(default_decompositions)
 
         def candidate(self):
+            def fw_compiler(model: torch.fx.GraphModule, example_inputs):
+                num_fixed = len(example_inputs) - self.num_example_inputs
+                return partial(prims_executor, executor=self.executor, num_fixed=num_fixed)(model, example_inputs)
+
+            def bw_compiler(model: torch.fx.GraphModule, example_inputs):
+                from torchinductor.compile_fx import count_tangents
+                num_fixed = count_tangents(model)
+                return partial(prims_executor, executor=self.executor, num_fixed=num_fixed)(model, example_inputs)
+
             return BACKENDS["aot_autograd"](
                 self.gm,
                 self.example_inputs,
-                fw_compiler=partial(prims_executor, executor=self.executor),
-                bw_compiler=partial(prims_executor, executor=self.executor),
+                fw_compiler=fw_compiler,
+                bw_compiler=bw_compiler,
                 decompositions=self.aten2aten_decompositions,
             )
 

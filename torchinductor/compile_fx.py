@@ -205,7 +205,7 @@ def cudagraphify_impl(model, inputs, static_input_idxs=()):
     """
     Assumes inputs[static_input_idxs[i]] are always the same memory address
     """
-    static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+    # static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
 
     def static_input(x):
         """

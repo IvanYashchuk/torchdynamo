@@ -347,6 +347,33 @@ def has_incompatible_cudagraph_ops(gm):
     return False
 
 
+def align_inputs(model, inputs, static_input_idxs=()):
+    # Almost a copy of torchinductor.compile_fx.align_inputs
+    # But we don't want to align the inputs to the model
+    # Only move CPU inputs to CUDA
+    from torchinductor.compile_fx import is_unspec_input
+    check_inputs = [
+        i
+        for i in range(len(inputs))
+        # if (i not in static_input_idxs or (inputs[i].data_ptr() % ALIGNMENT) != 0)
+        if inputs[i].device.type == "cuda"
+    ]
+
+    if len(check_inputs) == 0:
+        return model
+
+    def run(*new_inputs):
+        # for i in check_inputs:
+        #     if new_inputs[i].data_ptr() % ALIGNMENT:
+        #         if isinstance(new_inputs, tuple):
+        #             new_inputs = list(new_inputs)
+        #         new_inputs[i] = clone_preserve_strides(new_inputs[i])
+        new_inputs = [x.to("cuda") if is_unspec_input(x) else x for x in new_inputs]
+        return model(*new_inputs)
+
+    return run
+
+
 def prims_executor(gm, inputs, *, executor, num_fixed=0):
     # This function is called once per forward/backward pass of a graph in AOT
     # Autograd. We use it to set up the nvFuser-specific FX graph and return
@@ -354,7 +381,7 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
     from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch._prims.executor import execute
     from torch.fx.experimental.proxy_tensor import make_fx
-    from torchinductor.compile_fx import align_inputs, cudagraphify
+    from torchinductor.compile_fx import cudagraphify
 
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor

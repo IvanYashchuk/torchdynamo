@@ -340,6 +340,7 @@ def has_incompatible_cudagraph_ops(gm):
 
     incompatible = [
         "aten.index_put.default",
+        "aten.ones.default",
     ]
     for node in gm.graph.nodes:
         if str(node.target) in incompatible:

@@ -338,6 +338,30 @@ def prims_executor(gm, inputs, *, executor):
     return partial(execute, prim_gm, executor=executor)
 
 
+def nvprims_partition_fn(joint_module, joint_inputs):
+    from functorch.compile import min_cut_rematerialization_partition
+    from torch._prims.context import TorchRefsNvfuserCapabilityMode
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    # AOT Autograd expects arguments to be named exactly "primals, tangents"
+    def func(primals, tangents):
+        return joint_module(primals, tangents)
+
+    with TorchRefsNvfuserCapabilityMode():
+        prim_gm = make_fx(func)(*joint_inputs)
+
+    # all nvprims for now
+    recomputable_ops = [
+        getattr(torch.ops.nvprims, prim)
+        for prim in dir(torch.ops.nvprims)
+        if isinstance(getattr(torch.ops.nvprims, prim), torch._ops.OpOverloadPacket)
+    ]
+
+    return min_cut_rematerialization_partition(
+        prim_gm, joint_inputs, recomputable_ops=recomputable_ops
+    )
+
+
 def create_nvprims_backend(*, executor):
     class NvPrims(AotAutogradStrategy):
         def __init__(self, gm: torch.fx.GraphModule, example_inputs):
@@ -350,6 +374,7 @@ def create_nvprims_backend(*, executor):
                 self.example_inputs,
                 fw_compiler=partial(prims_executor, executor=self.executor),
                 bw_compiler=partial(prims_executor, executor=self.executor),
+                partition_fn=nvprims_partition_fn,
             )
 
     return NvPrims

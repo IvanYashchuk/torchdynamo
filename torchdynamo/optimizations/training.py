@@ -340,11 +340,18 @@ def has_incompatible_cudagraph_ops(gm):
 
     incompatible = [
         "aten.index_put.default",
-        "aten.ones.default",
     ]
     for node in gm.graph.nodes:
         if str(node.target) in incompatible:
             return True
+
+    # A workaround for
+    # https://github.com/csarofeen/pytorch/issues/2106
+    is_any_ones = any(node.target == torch.ops.aten.ones.default for node in gm.graph.nodes)
+    is_any_zeros = any(node.target == torch.ops.aten.zeros.default for node in gm.graph.nodes)
+    if is_any_ones and is_any_zeros:
+        return True
+
     return False
 
 

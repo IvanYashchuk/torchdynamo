@@ -383,6 +383,20 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
     from torch.fx.experimental.proxy_tensor import make_fx
     from torchinductor.compile_fx import cudagraphify
 
+    # cudagraphify fails if intermediate tensors are CPU and there's an attempt
+    # to send them to CUDA
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target in [
+            torch.ops.aten.arange.default,
+            torch.ops.aten.arange.start_step,
+            torch.ops.aten.full.default,
+        ]:
+            new_kwargs = dict(node.kwargs)
+            if new_kwargs.get("device", False) and new_kwargs["device"].type == "cpu":
+                new_kwargs["device"] = torch.device("cuda")
+            node.kwargs = new_kwargs
+    gm.recompile()
+
     # First we trace the graph conditionally decomposing nodes
     # that can be sent to the nvfuser executor
     with TorchRefsNvfuserCapabilityMode():

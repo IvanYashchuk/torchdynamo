@@ -325,28 +325,29 @@ def prims_executor(gm, inputs, *, executor):
     # This function is called once per forward/backward pass of a graph in AOT
     # Autograd. We use it to set up the nvFuser-specific FX graph and return
     # execute function.
-    from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch._prims.executor import execute
-    from torch.fx.experimental.proxy_tensor import make_fx
 
-    # First we trace the graph conditionally decomposing nodes
-    # that can be sent to the nvfuser executor
-    with TorchRefsNvfuserCapabilityMode():
-        prim_gm = make_fx(gm)(*inputs)
-
-    # Then we return a callable that executes the "prim_gm" graph
-    return partial(execute, prim_gm, executor=executor)
+    # We return a callable that executes the "gm" graph. It's assumed that "gm"
+    # was re-traced with the TorchRefsNvfuserCapabilityMode in the
+    # forward-backward partition function
+    return partial(execute, gm, executor=executor)
 
 
-def nvprims_partition_fn(joint_module, joint_inputs):
+def nvprims_fw_bw_partition_fn(joint_module, joint_inputs):
+    # This function is called once per forward+backward pass of a graph in AOT
+    # Autograd. We use it to set up the nvFuser-specific FX graph that is later
+    # passed to the executor.
     from functorch.compile import min_cut_rematerialization_partition
     from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch.fx.experimental.proxy_tensor import make_fx
 
-    # AOT Autograd expects arguments to be named exactly "primals, tangents"
+    # AOT Autograd expects arguments of the traced function to be named exactly
+    # "primals, tangents"
     def func(primals, tangents):
         return joint_module(primals, tangents)
 
+    # First we trace the graph conditionally decomposing nodes
+    # that can be sent to the nvfuser executor
     with TorchRefsNvfuserCapabilityMode():
         prim_gm = make_fx(func)(*joint_inputs)
 
@@ -374,7 +375,7 @@ def create_nvprims_backend(*, executor):
                 self.example_inputs,
                 fw_compiler=partial(prims_executor, executor=self.executor),
                 bw_compiler=partial(prims_executor, executor=self.executor),
-                partition_fn=nvprims_partition_fn,
+                partition_fn=nvprims_fw_bw_partition_fn,
             )
 
     return NvPrims

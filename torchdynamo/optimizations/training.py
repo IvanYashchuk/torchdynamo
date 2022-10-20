@@ -386,9 +386,7 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
     # This function is called once per forward/backward pass of a graph in AOT
     # Autograd. We use it to set up the nvFuser-specific FX graph and return
     # execute function.
-    from torch._prims.context import TorchRefsNvfuserCapabilityMode
     from torch._prims.executor import execute
-    from torch.fx.experimental.proxy_tensor import make_fx
     from torchinductor.compile_fx import cudagraphify
 
     # cudagraphify fails if intermediate tensors are CPU and there's an attempt
@@ -405,21 +403,44 @@ def prims_executor(gm, inputs, *, executor, num_fixed=0):
             node.kwargs = new_kwargs
     gm.recompile()
 
-    # First we trace the graph conditionally decomposing nodes
-    # that can be sent to the nvfuser executor
-    with TorchRefsNvfuserCapabilityMode():
-        prim_gm = make_fx(gm)(*inputs)
-
-    # Then we return a callable that executes the "prim_gm" graph
-    # return partial(execute, prim_gm, executor=executor)
     params = {"allow_single_op_fusion": False}
-    run = partial(execute, prim_gm, executor=executor, executor_parameters=params)
-    if has_incompatible_cudagraph_ops(prim_gm):
+    run = partial(execute, gm, executor=executor, executor_parameters=params)
+    if has_incompatible_cudagraph_ops(gm):
         return run
 
     compiled_fn = cudagraphify(run, inputs, range(num_fixed))
     result = align_inputs(compiled_fn, inputs, range(num_fixed))
     return result
+
+
+def nvprims_fw_bw_partition_fn(joint_module, joint_inputs):
+    # This function is called once per forward+backward pass of a graph in AOT
+    # Autograd. We use it to set up the nvFuser-specific FX graph that is later
+    # passed to the executor.
+    from functorch.compile import min_cut_rematerialization_partition
+    from torch._prims.context import TorchRefsNvfuserCapabilityMode
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    # AOT Autograd expects arguments of the traced function to be named exactly
+    # "primals, tangents"
+    def func(primals, tangents):
+        return joint_module(primals, tangents)
+
+    # First we trace the graph conditionally decomposing nodes
+    # that can be sent to the nvfuser executor
+    with TorchRefsNvfuserCapabilityMode():
+        prim_gm = make_fx(func)(*joint_inputs)
+
+    # all nvprims for now
+    recomputable_ops = [
+        getattr(torch.ops.nvprims, prim)
+        for prim in dir(torch.ops.nvprims)
+        if isinstance(getattr(torch.ops.nvprims, prim), torch._ops.OpOverloadPacket)
+    ]
+
+    return min_cut_rematerialization_partition(
+        prim_gm, joint_inputs, recomputable_ops=recomputable_ops
+    )
 
 
 def create_nvprims_backend(*, executor):
@@ -444,6 +465,7 @@ def create_nvprims_backend(*, executor):
                 self.example_inputs,
                 fw_compiler=fw_compiler,
                 bw_compiler=bw_compiler,
+                partition_fn=nvprims_fw_bw_partition_fn,
             )
 
     return NvPrims

@@ -439,6 +439,13 @@ def nvprims_fw_bw_partition_fn(joint_module, joint_inputs):
     } - {
         # Remove random ops from recomputable ops
         torch.ops.nvprims.rand_like,
+        # Remove reduction/normalization ops from recomputable ops
+        torch.ops.nvprims.sum,
+        torch.ops.nvprims.var,
+        torch.ops.nvprims.var_mean,
+        torch.ops.nvprims.native_batch_norm,
+        torch.ops.nvprims.amax,
+        torch.ops.nvprims.amin,
     }
 
     return min_cut_rematerialization_partition(

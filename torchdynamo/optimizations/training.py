@@ -352,11 +352,14 @@ def nvprims_fw_bw_partition_fn(joint_module, joint_inputs):
         prim_gm = make_fx(func)(*joint_inputs)
 
     # all nvprims for now
-    recomputable_ops = [
+    recomputable_ops = {
         getattr(torch.ops.nvprims, prim)
         for prim in dir(torch.ops.nvprims)
         if isinstance(getattr(torch.ops.nvprims, prim), torch._ops.OpOverloadPacket)
-    ]
+    } - {
+        # Remove random ops from recomputable ops
+        torch.ops.nvprims.rand_like,
+    }
 
     return min_cut_rematerialization_partition(
         prim_gm, joint_inputs, recomputable_ops=recomputable_ops
